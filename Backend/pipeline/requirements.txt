@@ -1,0 +1,5 @@
+pandas
+yfinance
+transformers
+torch
+python-dotenv

@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+pandas
+python-dotenv
+
+google-adk
+google-auth
