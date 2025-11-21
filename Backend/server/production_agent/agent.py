@@ -1,111 +1,73 @@
+# production_agent/agent.py
+
 import os
 from pathlib import Path
-
 from dotenv import load_dotenv
-from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
-import google.auth
+from google import genai
 
-# ============================================================
-# Load environment variables
-# ============================================================
-
-# Resolve to server/ folder
 ROOT = Path(__file__).parent.parent
 ENV_PATH = ROOT / ".env"
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 
-# ============================================================
-# Google Cloud project auto-detection (optional, for logs/metadata)
-# ============================================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY","AIzaSyC0oScY6NDn3vL0NTFscEL4b3QYmO5Qh3I")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set in .env")
 
-# try:
-#     _, project_id = google.auth.default()
-#     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
-# except Exception:
-#     pass
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "europe-west1")
+FIN_PROMPT = """
+You are FinSight. Output ONLY JSON.
 
-# ============================================================
-# Model configuration (Gemma via Ollama / LiteLLM backend)
-# ============================================================
+OUT OF CONTEXT RULE:
+If the news does NOT contain these words:
+- reliance
+- ril
+- reliance jio
+- jio
+- reliance retail
+- reliance industries
 
-GEMMA_MODEL = os.getenv("GEMMA_MODEL_NAME", "gemma3:270m")
-API_BASE = "https://ollama-gemma3-270m-gpu-1003577856314.europe-west1.run.app"
-print(f"[agent.py] Using Ollama API_BASE: {API_BASE}")
-
-# ============================================================
-# FinSight Production Agent
-# ============================================================
-
-production_agent = Agent(
-    model=LiteLlm(
-        model=f"ollama_chat/{GEMMA_MODEL}",
-        api_base=API_BASE,
-    ),
-    name="finsight_agent",
-    description="FinSight AI Agent — explains financial news about Reliance.",
-    instruction="""
-You are FinSight, an AI assistant that explains stock market news
-about Reliance Industries (RELIANCE.NS).
-
-You will receive:
-- Latest price and recent movement (context only)
-- Recent sentiment trend from news (context only)
-- A single news text (headline + description or a paragraph)
-
-Your tasks:
-1. Decide if the news is REAL or FAKE.
-2. Decide the overall sentiment: positive / negative / neutral.
-3. Give a sentiment score between 0 and 1 (float).
-4. Give a likely market stance about the stock:
-   - label: "bullish", "bearish", or "neutral"
-   - score: float between 0 and 1
-5. Provide 1–3 short textual reasons.
-
-VERY IMPORTANT OUTPUT RULES:
-- You MUST respond with ONLY valid JSON.
-- Do NOT add markdown, no ``` fences, no explanations outside JSON.
-- Do NOT add extra fields.
-- Do NOT include any disclaimers or extra sentences outside JSON.
-- Do NOT use placeholder strings like:
-  - "real or fake"
-  - "positive | negative | neutral"
-  - "bullish | bearish | neutral"
-  - "reason 1", "reason 2"
-  Instead, choose ONE concrete value for each field based on the news.
-
-Your JSON MUST have exactly this structure and REAL example-like values:
+Return EXACTLY this:
 
 {
-  "news_verdict": "real",
-  "sentiment": "positive",
-  "sentiment_score": 0.87,
-  "market_stance": {
-    "label": "bullish",
-    "score": 0.76
-  },
-  "reasons": [
-    "The announcement is consistent with prior company plans.",
-    "Market reaction and context suggest a positive outlook."
-  ]
+  "news_verdict": "out_of_context",
+  "sentiment": "neutral",
+  "sentiment_score": 0.0,
+  "market_stance": { "label": "neutral", "score": 0.0 },
+  "reasons": ["The news is not about Reliance."]
 }
 
-Where:
-- "news_verdict" is exactly "real" or "fake"
-- "sentiment" is exactly "positive", "negative", or "neutral"
-- "sentiment_score" is a float between 0 and 1
-- "market_stance.label" is exactly "bullish", "bearish", or "neutral"
-- "market_stance.score" is a float between 0 and 1
-- "reasons" is a list of 1–3 short strings.
+WHEN NEWS *IS* ABOUT RELIANCE:
+Return JSON with exactly:
 
-Always choose specific values based on the given news.
-Return ONLY this JSON. Nothing else.
-""",
-    tools=[],   # no tools for now
-)
+{
+  "news_verdict": "real or fake",
+  "sentiment": "positive or negative or neutral",
+  "sentiment_score": 0-1 float,
+  "market_stance": {
+    "label": "bullish or bearish or neutral",
+    "score": 0-1 float
+  },
+  "reasons": ["short reason 1", "short reason 2"]
+}
 
-# ADK expects a root agent symbol
-root_agent = production_agent
+Rules:
+- No markdown.
+- No text outside JSON.
+- No extra fields.
+"""
+
+def run_finsight(news: str) -> str:
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=f"{FIN_PROMPT}\nNews: {news}",
+        # 👇 IMPORTANT: in google-genai this is `config`, not `generation_config`
+        config={
+            "temperature": 0.1,
+            "max_output_tokens": 256,
+            "response_mime_type": "application/json",
+        },
+    )
+    # For google-genai, the JSON string is in response.text
+    return response.text

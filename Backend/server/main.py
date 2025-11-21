@@ -1,270 +1,248 @@
+# server/main.py
+
 import os
 import json
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import List, Optional, Dict
+from difflib import SequenceMatcher
 
+import requests
 from dotenv import load_dotenv
-import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-import litellm
-from production_agent.agent import GEMMA_MODEL, API_BASE, production_agent
+from production_agent.agent import run_finsight  # Gemini wrapper
 
-# =========================
-# Env & paths
-# =========================
+# ============================================================
+# ENV & PATHS
+# ============================================================
 
 load_dotenv()
 
-# Default to ../data relative to this file if DATA_DIR not set
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR)
 print("Using DATA_DIR:", DATA_DIR)
 
-STOCK_FILE = os.path.join(DATA_DIR, "reliance_stock_history.csv")
-NEWS_SENT_FILE = os.path.join(DATA_DIR, "reliance_news_sentiment.csv")
+RELIANCE_JSON = os.path.join(DATA_DIR, "reliance_news.json")
 
-# =========================
-# LLM / Agent config
-# =========================
+MEDIASTACK_API_KEY = os.getenv("MEDIASTACK_API_KEY", "")
 
-FIN_SIGHT_SYSTEM_PROMPT = production_agent.instruction
-
-print(f"[main.py] Using model: ollama_chat/{GEMMA_MODEL}")
-print(f"[main.py] Using API_BASE: {API_BASE}")
-
-
-def run_finsight_agent(prompt: str) -> str:
-    """
-    Call the Gemma model via LiteLLM + Ollama.
-    Completely stateless: every call is a fresh completion.
-    """
-    try:
-        response = litellm.completion(
-            model=f"ollama_chat/{GEMMA_MODEL}",
-            messages=[
-                {"role": "system", "content": FIN_SIGHT_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            api_base=API_BASE,
-        )
-    except Exception as e:
-        print("[run_finsight_agent] Error calling LiteLLM/Ollama:", e)
-        raise
-
-    try:
-        return response["choices"][0]["message"]["content"]
-    except Exception as e:
-        print("[run_finsight_agent] Unexpected response format:", response)
-        raise RuntimeError("Model returned an unexpected response format") from e
-
-
-# =========================
-# FastAPI setup
-# =========================
+# ============================================================
+# FASTAPI APP
+# ============================================================
 
 app = FastAPI(
     title="FinSight AI Backend",
-    description="Reads Reliance dataset and uses Gemma (via Ollama) to analyze news.",
+    description="Reliance Fake-News Checker (Local DB + Mediastack + Gemini)",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# Pydantic models
-# =========================
+# ============================================================
+# MODELS
+# ============================================================
 
 class NewsRequest(BaseModel):
-    # Frontend sends only one field: { "News": "..." } or { "news": "..." }
-    News: str | None = None
-    news: str | None = None
-
-
-class StockData(BaseModel):
-    last_close: float | None = None
-    prev_close: float | None = None
-    daily_change_percent: float | None = None
-
-
-class HistoricalSentiment(BaseModel):
-    last_7_days: Dict[str, int] = {}
-    overall_trend: str = "Unknown"
+    News: Optional[str] = None
+    news: Optional[str] = None
 
 
 class MarketStance(BaseModel):
-    label: str              # "bullish" / "bearish" / "neutral"
-    score: float | None = None  # 0–1
+    label: str
+    score: Optional[float]
 
 
 class FinSightLLMResponse(BaseModel):
-    news_verdict: str           # "real" or "fake"
-    sentiment: str              # "positive" / "negative" / "neutral"
-    sentiment_score: float | None = None
+    news_verdict: str
+    sentiment: str
+    sentiment_score: Optional[float]
     market_stance: MarketStance
     reasons: List[str]
 
+# ============================================================
+# LOCAL RELIANCE NEWS HELPERS
+# ============================================================
 
-# =========================
-# Helpers
-# =========================
+def load_local_reliance_news() -> List[dict]:
+    """Supports JSON formats: {"articles": [...]}, {"data": [...]}, or list."""
+    if not os.path.exists(RELIANCE_JSON):
+        return []
+    try:
+        with open(RELIANCE_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-def load_stock_data() -> StockData:
-    if not os.path.exists(STOCK_FILE):
-        print(f"[load_stock_data] Stock file not found: {STOCK_FILE}")
-        return StockData()
+        if isinstance(data, dict):
+            if isinstance(data.get("articles"), list):
+                return data["articles"]
+            if isinstance(data.get("data"), list):
+                return data["data"]
 
-    df = pd.read_csv(STOCK_FILE)
-    if df.empty:
-        print("[load_stock_data] Stock file is empty")
-        return StockData()
+        if isinstance(data, list):
+            return data
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-    df = df.sort_values("Date")
-
-    last = df.iloc[-1]
-    last_close = float(last["Close"])
-
-    prev_close = None
-    change_pct = None
-
-    if len(df) > 1:
-        prev = df.iloc[-2]
-        prev_close = float(prev["Close"])
-        if prev_close != 0:
-            change_pct = ((last_close - prev_close) / prev_close) * 100.0
-
-    return StockData(
-        last_close=last_close,
-        prev_close=prev_close,
-        daily_change_percent=change_pct,
-    )
+        return []
+    except:
+        return []
 
 
-def load_historical_sentiment(days: int = 7) -> HistoricalSentiment:
-    if not os.path.exists(NEWS_SENT_FILE):
-        print(f"[load_historical_sentiment] Sentiment file not found: {NEWS_SENT_FILE}")
-        return HistoricalSentiment()
+def find_local_article(query: str, threshold: float = 0.6) -> Optional[Dict]:
+    """Return article dict if similarity high enough."""
+    db = load_local_reliance_news()
+    if not db:
+        return None
 
-    df = pd.read_csv(NEWS_SENT_FILE)
-    if df.empty or "published_at" not in df.columns:
-        print("[load_historical_sentiment] Empty sentiment file or missing published_at")
-        return HistoricalSentiment()
+    q = query.lower().strip()
+    best_score = 0.0
+    best_article = None
 
-    df["published_at"] = pd.to_datetime(
-        df["published_at"], errors="coerce", utc=True
-    )
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    recent = df[df["published_at"] >= cutoff]
+    for item in db:
+        if not isinstance(item, dict):
+            continue
 
-    if recent.empty:
-        return HistoricalSentiment(overall_trend="No recent data")
+        title = (item.get("title") or item.get("headline") or "").lower().strip()
+        if not title:
+            continue
 
-    counts = recent["sentiment"].value_counts().to_dict()
+        score = SequenceMatcher(None, q, title).ratio()
+        if score > best_score:
+            best_score = score
+            best_article = item
 
-    if not counts:
-        trend = "No recent data"
-    else:
-        top = max(counts, key=counts.get).upper()
-        if "POS" in top:
-            trend = "Mostly positive"
-        elif "NEG" in top:
-            trend = "Mostly negative"
-        else:
-            trend = "Mostly neutral"
+    if best_article and best_score >= threshold:
+        return best_article
 
-    return HistoricalSentiment(last_7_days=counts, overall_trend=trend)
+    return None
 
+# ============================================================
+# MEDIATSTACK CHECK
+# ============================================================
 
-def extract_json_from_text(text: str) -> str:
-    """
-    Clean LLM output:
-    - remove ```...``` fences if present
-    - keep only substring from first '{' to last '}'
-    """
-    if not text:
-        return ""
-
-    cleaned = text.strip()
-
-    # Remove markdown code-fence lines
-    lines = cleaned.splitlines()
-    lines = [ln for ln in lines if not ln.strip().startswith("```")]
-    cleaned = "\n".join(lines).strip()
-
-    # Narrow down to the JSON object
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and start < end:
-        cleaned = cleaned[start : end + 1]
-
-    return cleaned.strip()
+def _shorten_query(query: str) -> str:
+    words = query.lower().split()[:10]
+    if "reliance" not in words:
+        words.append("reliance")
+    return " ".join(words)
 
 
-# =========================
-# Routes
-# =========================
+def search_mediastack(query: str, threshold: float = 0.6) -> Optional[bool]:
+    """Return True (match), False (no match), or None if API failed."""
+    if not MEDIASTACK_API_KEY:
+        return None
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "data_dir": DATA_DIR,
-        "stock_file_exists": os.path.exists(STOCK_FILE),
-        "news_sentiment_file_exists": os.path.exists(NEWS_SENT_FILE),
+    url = "http://api.mediastack.com/v1/news"
+    params = {
+        "access_key": MEDIASTACK_API_KEY,
+        "keywords": _shorten_query(query),
+        "languages": "en",
+        "limit": 10,
     }
 
+    try:
+        resp = requests.get(url, params=params, timeout=8)
+        data = resp.json()
+
+        articles = data.get("data") or data.get("articles") or []
+        if not articles:
+            return False
+
+        q = query.lower().strip()
+        best = 0.0
+
+        for art in articles:
+            title = (art.get("title") or "").lower().strip()
+            if not title:
+                continue
+
+            score = SequenceMatcher(None, q, title).ratio()
+            best = max(best, score)
+
+            if score >= threshold:
+                return True
+
+        return False
+
+    except:
+        return None  # API failed → let Gemini decide
+
+# ============================================================
+# ROUTES
+# ============================================================
 
 @app.post("/analyze-news", response_model=FinSightLLMResponse)
 def analyze_news(payload: NewsRequest):
-    # Get the text from either "News" or "news"
-    raw_news = payload.News or payload.news or ""
-    news = raw_news.strip()
 
+    news = (payload.News or payload.news or "").strip()
     if not news:
-        raise HTTPException(status_code=400, detail="News text is empty")
+        raise HTTPException(400, "News text empty")
 
-    # Context from datasets (used only in prompt)
-    stock = load_stock_data()
-    hist = load_historical_sentiment(days=7)
+    # 1️⃣ Check LOCAL
+    local_article = find_local_article(news)
 
-    context_prompt = f"""
-You are FinSight, analyzing a Reliance news item.
+    # 2️⃣ Check Mediastack only if not found locally
+    mediastack_result = None
+    if not local_article:
+        mediastack_result = search_mediastack(news)
 
-Context:
-- Last close price: {stock.last_close}
-- Previous close price: {stock.prev_close}
-- Daily change (%): {stock.daily_change_percent}
-- Recent 7-day sentiment counts: {hist.last_7_days}
-- Overall sentiment trend: {hist.overall_trend}
-
-News:
+    # 3️⃣ Build Gemini input based on cases
+    if local_article:
+        # CASE A: FOUND IN LOCAL DB
+        gemini_input = f"""
+User news:
 {news}
+
+[VERIFIED_LOCAL_DB_RECORD]
+{json.dumps(local_article, ensure_ascii=False)}
+
+This article WAS FOUND in our verified local Reliance news database.
+Treat the news as REAL.
+Return your final JSON only.
+"""
+    elif mediastack_result is True:
+        # CASE B: FOUND IN MEDIASTACK
+        gemini_input = f"""
+User news:
+{news}
+
+[MATCHED_ON_MEDIASTACK]
+This news was found online on Mediastack.
+Treat it as LIKELY REAL, but verify carefully.
+Return only the final JSON.
+"""
+    elif mediastack_result is False:
+        # CASE C: NOT found in local AND NOT found in Mediastack → send to Gemini
+        gemini_input = f"""
+User news:
+{news}
+
+[NOT_FOUND_ANYWHERE]
+This news was NOT found in our local Reliance DB and NOT found on Mediastack.
+There are chances this news is FAKE.
+You decide REAL or FAKE based on the text.
+Return ONLY the final JSON.
+"""
+    else:
+        # CASE D: Mediastack API failed → fail-open, ask Gemini to judge
+        gemini_input = f"""
+User news:
+{news}
+
+[MAYBE_REAL]
+Online verification could not be performed. Please analyze the text carefully.
+in the absence of any verification, decide if the news is REAL or FAKE based on the content.
+Return ONLY the final JSON.
 """
 
+    # 4️⃣ Call Gemini
     try:
-        llm_raw = run_finsight_agent(context_prompt)
-        print("[analyze-news] Raw LLM output:", llm_raw)
-
-        cleaned = extract_json_from_text(llm_raw)
-        print("[analyze-news] Cleaned JSON string:", cleaned)
-
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        print("[analyze-news] JSON parse error:", e)
-        raise HTTPException(
-            status_code=500,
-            detail="Model did not return valid JSON",
-        )
+        raw = run_finsight(gemini_input)
+        parsed = json.loads(raw)
+        return FinSightLLMResponse(**parsed)
     except Exception as e:
-        print("Error running FinSight agent:", e)
-        raise HTTPException(status_code=500, detail="Agent analysis failed")
-
-    return FinSightLLMResponse(**parsed)
+        print("[Gemini Error]", e)
+        raise HTTPException(500, "Gemini LLM failed")

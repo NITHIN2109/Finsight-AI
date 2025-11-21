@@ -6,3 +6,4 @@ python-dotenv
 litellm
 google-adk
 google-auth
+google-genai
