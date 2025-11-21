@@ -1,6 +1,7 @@
 import os
+import json
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, List
 
 from dotenv import load_dotenv
 import pandas as pd
@@ -26,10 +27,9 @@ STOCK_FILE = os.path.join(DATA_DIR, "reliance_stock_history.csv")
 NEWS_SENT_FILE = os.path.join(DATA_DIR, "reliance_news_sentiment.csv")
 
 # =========================
-# LLM / Agent config (no Runner)
+# LLM / Agent config
 # =========================
 
-# Use the same instruction text you defined in production_agent
 FIN_SIGHT_SYSTEM_PROMPT = production_agent.instruction
 
 print(f"[main.py] Using model: ollama_chat/{GEMMA_MODEL}")
@@ -38,7 +38,7 @@ print(f"[main.py] Using API_BASE: {API_BASE}")
 
 def run_finsight_agent(prompt: str) -> str:
     """
-    Call the Gemma model via LiteLLM + Ollama (no ADK Runner).
+    Call the Gemma model via LiteLLM + Ollama.
     Completely stateless: every call is a fresh completion.
     """
     try:
@@ -54,7 +54,6 @@ def run_finsight_agent(prompt: str) -> str:
         print("[run_finsight_agent] Error calling LiteLLM/Ollama:", e)
         raise
 
-    # LiteLLM returns OpenAI-style responses
     try:
         return response["choices"][0]["message"]["content"]
     except Exception as e:
@@ -84,8 +83,9 @@ app.add_middleware(
 # =========================
 
 class NewsRequest(BaseModel):
-    headline: str
-    description: str | None = ""
+    # Frontend sends only one field: { "News": "..." } or { "news": "..." }
+    News: str | None = None
+    news: str | None = None
 
 
 class StockData(BaseModel):
@@ -99,16 +99,21 @@ class HistoricalSentiment(BaseModel):
     overall_trend: str = "Unknown"
 
 
-class AnalyzeNewsResponse(BaseModel):
-    stock: str
-    explanation: str
-    stock_data: StockData
-    historical_sentiment: HistoricalSentiment
-    disclaimer: str
+class MarketStance(BaseModel):
+    label: str              # "bullish" / "bearish" / "neutral"
+    score: float | None = None  # 0–1
+
+
+class FinSightLLMResponse(BaseModel):
+    news_verdict: str           # "real" or "fake"
+    sentiment: str              # "positive" / "negative" / "neutral"
+    sentiment_score: float | None = None
+    market_stance: MarketStance
+    reasons: List[str]
 
 
 # =========================
-# Dataset helpers
+# Helpers
 # =========================
 
 def load_stock_data() -> StockData:
@@ -121,7 +126,6 @@ def load_stock_data() -> StockData:
         print("[load_stock_data] Stock file is empty")
         return StockData()
 
-    # Normalize and sort by date
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
     df = df.sort_values("Date")
 
@@ -179,6 +183,31 @@ def load_historical_sentiment(days: int = 7) -> HistoricalSentiment:
     return HistoricalSentiment(last_7_days=counts, overall_trend=trend)
 
 
+def extract_json_from_text(text: str) -> str:
+    """
+    Clean LLM output:
+    - remove ```...``` fences if present
+    - keep only substring from first '{' to last '}'
+    """
+    if not text:
+        return ""
+
+    cleaned = text.strip()
+
+    # Remove markdown code-fence lines
+    lines = cleaned.splitlines()
+    lines = [ln for ln in lines if not ln.strip().startswith("```")]
+    cleaned = "\n".join(lines).strip()
+
+    # Narrow down to the JSON object
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        cleaned = cleaned[start : end + 1]
+
+    return cleaned.strip()
+
+
 # =========================
 # Routes
 # =========================
@@ -193,19 +222,19 @@ def health():
     }
 
 
-@app.post("/analyze-news", response_model=AnalyzeNewsResponse)
+@app.post("/analyze-news", response_model=FinSightLLMResponse)
 def analyze_news(payload: NewsRequest):
-    headline = (payload.headline or "").strip()
-    description = (payload.description or "").strip()
+    # Get the text from either "News" or "news"
+    raw_news = payload.News or payload.news or ""
+    news = raw_news.strip()
 
-    if not headline:
-        raise HTTPException(status_code=400, detail="headline is required")
+    if not news:
+        raise HTTPException(status_code=400, detail="News text is empty")
 
-    # 1) Load context from dataset
+    # Context from datasets (used only in prompt)
     stock = load_stock_data()
     hist = load_historical_sentiment(days=7)
 
-    # 2) Build prompt to send into LLM
     context_prompt = f"""
 You are FinSight, analyzing a Reliance news item.
 
@@ -217,30 +246,25 @@ Context:
 - Overall sentiment trend: {hist.overall_trend}
 
 News:
-Headline: {headline}
-Description: {description}
-
-Please follow your FinSight instructions:
-- Restate the news simply (whether it is fake or real in one word) 
-- Explain sentiment (positive/negative/neutral in one word) 
--Sentiement score
-- Explain a likely market stance (bullish/bearish/neutral from 0 to 1)
-- Give 1-3 brief 
-- Do NOT give financial advice
-- End with: "This analysis is for educational purposes only, not financial advice."
-Give response in json only with fields: restate , sentiment, sentiment_score, market_stance, reasons.
+{news}
 """
 
     try:
-        explanation = run_finsight_agent(context_prompt)
+        llm_raw = run_finsight_agent(context_prompt)
+        print("[analyze-news] Raw LLM output:", llm_raw)
+
+        cleaned = extract_json_from_text(llm_raw)
+        print("[analyze-news] Cleaned JSON string:", cleaned)
+
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print("[analyze-news] JSON parse error:", e)
+        raise HTTPException(
+            status_code=500,
+            detail="Model did not return valid JSON",
+        )
     except Exception as e:
         print("Error running FinSight agent:", e)
         raise HTTPException(status_code=500, detail="Agent analysis failed")
 
-    return AnalyzeNewsResponse(
-        stock="RELIANCE.NS",
-        explanation=explanation,
-        stock_data=stock,
-        historical_sentiment=hist,
-        disclaimer="This analysis is for educational purposes only, not financial advice.",
-    )
+    return FinSightLLMResponse(**parsed)
