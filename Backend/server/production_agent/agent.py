@@ -1,5 +1,3 @@
-# server/production_agent/agent.py
-
 import os
 from pathlib import Path
 
@@ -12,6 +10,7 @@ import google.auth
 # Load environment variables
 # ============================================================
 
+# Resolve to server/ folder
 ROOT = Path(__file__).parent.parent
 ENV_PATH = ROOT / ".env"
 if ENV_PATH.exists():
@@ -21,20 +20,21 @@ if ENV_PATH.exists():
 # Google Cloud project auto-detection (optional, for logs/metadata)
 # ============================================================
 
-try:
-    _, project_id = google.auth.default()
-    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
-except Exception:
-    pass
+# try:
+#     _, project_id = google.auth.default()
+#     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
+# except Exception:
+#     pass
 
-os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "us-central1")
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "europe-west1")
 
 # ============================================================
 # Model configuration (Gemma via Ollama / LiteLLM backend)
 # ============================================================
 
 GEMMA_MODEL = os.getenv("GEMMA_MODEL_NAME", "gemma3:270m")
-API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:10010")
+API_BASE ="https://ollama-gemma3-270m-gpu-1003577856314.europe-west1.run.app"
+print(f"[agent.py] Using Ollama API_BASE: {API_BASE}")
 
 # ============================================================
 # FinSight Production Agent
@@ -57,13 +57,13 @@ You receive context like:
 - One news headline and short description
 
 Your tasks:
-1. Briefly restate the news in simple words.
-2. Explain the likely sentiment impact on Reliance:
-   - Is it Positive, Negative, or Neutral?
-   - Give 1–3 short reasons.
-3. Describe the *market stance*:
-   - Bullish, Bearish, or Neutral (as an interpretation of sentiment,
-     NOT as trading advice).
+- Restate the news simply (whether it is fake or real in one word) 
+- Explain sentiment (positive/negative/neutral in one word) 
+-Sentiement score
+- Explain a likely market stance (bullish/bearish/neutral from 0 to 1)
+- Give 1-3 brief 
+- Do NOT give financial advice
+- End with: "This analysis is for educational purposes only, not financial advice."
 
 VERY IMPORTANT RULES:
 - Do NOT give financial advice.
@@ -82,4 +82,5 @@ Always end with this line exactly:
 )
 
 # ADK expects a root agent symbol
+# This assignment is what allows other files to import 'root_agent'
 root_agent = production_agent

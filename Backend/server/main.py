@@ -1,18 +1,15 @@
-# server/main.py
-
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
+from dotenv import load_dotenv
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
 
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from production_agent.agent import root_agent
+import litellm
+from production_agent.agent import GEMMA_MODEL, API_BASE, production_agent
 
 # =========================
 # Env & paths
@@ -20,52 +17,49 @@ from production_agent.agent import root_agent
 
 load_dotenv()
 
+# Default to ../data relative to this file if DATA_DIR not set
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR)
+print("Using DATA_DIR:", DATA_DIR)
 
 STOCK_FILE = os.path.join(DATA_DIR, "reliance_stock_history.csv")
 NEWS_SENT_FILE = os.path.join(DATA_DIR, "reliance_news_sentiment.csv")
 
 # =========================
-# ADK Agent setup (Runner inside main.py)
+# LLM / Agent config (no Runner)
 # =========================
 
-_session_service = InMemorySessionService()
-_runner = Runner(
-    agent=root_agent,
-    app_name="finsight_app",
-    session_service=_session_service,
-)
+# Use the same instruction text you defined in production_agent
+FIN_SIGHT_SYSTEM_PROMPT = production_agent.instruction
 
-_USER_ID = "finsight_user"
-_session = _runner.session_service.create_session(
-    app_name="finsight_app",
-    user_id=_USER_ID,
-)
-_SESSION_ID = _session.id
+print(f"[main.py] Using model: ollama_chat/{GEMMA_MODEL}")
+print(f"[main.py] Using API_BASE: {API_BASE}")
 
 
 def run_finsight_agent(prompt: str) -> str:
     """
-    Call the ADK agent with the given prompt and
-    return the final text response.
+    Call the Gemma model via LiteLLM + Ollama (no ADK Runner).
+    Completely stateless: every call is a fresh completion.
     """
-    last_text = ""
+    try:
+        response = litellm.completion(
+            model=f"ollama_chat/{GEMMA_MODEL}",
+            messages=[
+                {"role": "system", "content": FIN_SIGHT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            api_base=API_BASE,
+        )
+    except Exception as e:
+        print("[run_finsight_agent] Error calling LiteLLM/Ollama:", e)
+        raise
 
-    for event in _runner.run(
-        user_id=_USER_ID,
-        session_id=_SESSION_ID,
-        new_message=prompt,
-    ):
-        if getattr(event, "content", None) and event.content.parts:
-            for part in event.content.parts:
-                if getattr(part, "text", None):
-                    last_text = part.text
-
-    if not last_text:
-        raise RuntimeError("FinSight agent returned no text")
-
-    return last_text
+    # LiteLLM returns OpenAI-style responses
+    try:
+        return response["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("[run_finsight_agent] Unexpected response format:", response)
+        raise RuntimeError("Model returned an unexpected response format") from e
 
 
 # =========================
@@ -74,17 +68,16 @@ def run_finsight_agent(prompt: str) -> str:
 
 app = FastAPI(
     title="FinSight AI Backend",
-    description="Reads Reliance dataset and uses ADK FinSight agent to analyze news.",
+    description="Reads Reliance dataset and uses Gemma (via Ollama) to analyze news.",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in prod
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # =========================
 # Pydantic models
@@ -120,12 +113,15 @@ class AnalyzeNewsResponse(BaseModel):
 
 def load_stock_data() -> StockData:
     if not os.path.exists(STOCK_FILE):
+        print(f"[load_stock_data] Stock file not found: {STOCK_FILE}")
         return StockData()
 
     df = pd.read_csv(STOCK_FILE)
     if df.empty:
+        print("[load_stock_data] Stock file is empty")
         return StockData()
 
+    # Normalize and sort by date
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
     df = df.sort_values("Date")
 
@@ -134,6 +130,7 @@ def load_stock_data() -> StockData:
 
     prev_close = None
     change_pct = None
+
     if len(df) > 1:
         prev = df.iloc[-2]
         prev_close = float(prev["Close"])
@@ -149,10 +146,12 @@ def load_stock_data() -> StockData:
 
 def load_historical_sentiment(days: int = 7) -> HistoricalSentiment:
     if not os.path.exists(NEWS_SENT_FILE):
+        print(f"[load_historical_sentiment] Sentiment file not found: {NEWS_SENT_FILE}")
         return HistoricalSentiment()
 
     df = pd.read_csv(NEWS_SENT_FILE)
     if df.empty or "published_at" not in df.columns:
+        print("[load_historical_sentiment] Empty sentiment file or missing published_at")
         return HistoricalSentiment()
 
     df["published_at"] = pd.to_datetime(
@@ -202,9 +201,11 @@ def analyze_news(payload: NewsRequest):
     if not headline:
         raise HTTPException(status_code=400, detail="headline is required")
 
+    # 1) Load context from dataset
     stock = load_stock_data()
     hist = load_historical_sentiment(days=7)
 
+    # 2) Build prompt to send into LLM
     context_prompt = f"""
 You are FinSight, analyzing a Reliance news item.
 
@@ -220,11 +221,14 @@ Headline: {headline}
 Description: {description}
 
 Please follow your FinSight instructions:
-- Restate the news simply
-- Explain sentiment (positive/negative/neutral)
-- Explain a likely market stance (bullish/bearish/neutral)
+- Restate the news simply (whether it is fake or real in one word) 
+- Explain sentiment (positive/negative/neutral in one word) 
+-Sentiement score
+- Explain a likely market stance (bullish/bearish/neutral from 0 to 1)
+- Give 1-3 brief 
 - Do NOT give financial advice
 - End with: "This analysis is for educational purposes only, not financial advice."
+Give response in json only with fields: restate , sentiment, sentiment_score, market_stance, reasons.
 """
 
     try:
