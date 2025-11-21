@@ -10,7 +10,7 @@ ENV_PATH = ROOT / ".env"
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY","AIzaSyC0oScY6NDn3vL0NTFscEL4b3QYmO5Qh3I")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set in .env")
 
